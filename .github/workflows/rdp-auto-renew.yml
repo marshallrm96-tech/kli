@@ -1,0 +1,49 @@
+# OPTIONAL companion: auto-starts a FRESH RDP session on a schedule.
+#
+# ON/OFF SWITCH (future-proofed, off by default):
+#   Repo variable RDP_AUTO_RENEW — Settings > Secrets and variables > Actions
+#   > Variables tab. Set it to `true` to turn auto-renew on, `false` (or delete
+#   it) to turn it off. No file edits needed, ever.
+#   You can also test it once without flipping the switch: Actions tab >
+#   "RDP Auto-Renew" > Run workflow > tick `force`.
+#
+# What this does NOT do: extend a session past 6h. Impossible on hosted runners.
+# What it does: every 5h it triggers 'Windows Cloud RDP', giving you a brand-new
+# Windows VM (new Tailscale node, new IP, zero persistence). Useful if you want
+# *an* RDP available around the clock rather than one long-lived machine.
+#
+# REQUIRED SECRET (only when the switch is on):
+#   RENEW_PAT : classic Personal Access Token with the `workflow` scope.
+#               (The built-in GITHUB_TOKEN cannot trigger workflow_dispatch —
+#               GitHub blocks it deliberately to prevent infinite loops.)
+#
+# Caveats:
+#   - GitHub cron can lag by many minutes and gets auto-disabled after 60 days
+#     of repo inactivity.
+#   - If the previous RDP is still running when this fires, you get two
+#     concurrent sessions (harmless, just wasteful).
+#   - Private repos burn Actions minutes (Windows = 2x multiplier).
+
+name: RDP Auto-Renew
+
+on:
+  schedule:
+    - cron: '17 */5 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run once now even if auto-renew is off'
+        type: boolean
+        default: false
+
+jobs:
+  renew:
+    # Master switch: repo variable RDP_AUTO_RENEW == 'true' turns this on.
+    # The manual `force` input lets you test it once without flipping the switch.
+    if: ${{ vars.RDP_AUTO_RENEW == 'true' || inputs.force == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger fresh RDP run
+        env:
+          GH_TOKEN: ${{ secrets.RENEW_PAT }}
+        run: gh workflow run 'Windows Cloud RDP' --repo '${{ github.repository }}'
