@@ -1,0 +1,87 @@
+# Hardened Windows RDP via Tailscale on GitHub Actions.
+#
+# REALITY CHECK (read first):
+#   GitHub-hosted jobs are HARD-CAPPED at 6 hours (360 min) per GitHub's docs.
+#   There is no 48h option on hosted runners — the VM is reclaimed at 6h, period.
+#   This workflow runs a clean ~5h40m session and exits gracefully instead of
+#   being killed mid-loop. The only way past 6h is chaining FRESH runs
+#   (see rdp-auto-renew.yml) — each is a brand-new VM, nothing persists.
+#
+# REQUIRED REPO SECRETS (Settings > Secrets and variables > Actions):
+#   TAILSCALE_AUTHKEY : auth key from https://login.tailscale.com/admin/settings/keys
+#                       MUST be reusable; STRONGLY recommended: check "Ephemeral"
+#                       so dead nodes auto-remove from your tailnet.
+#   RDP_PASSWORD      : (optional) your RDP password. If unset, a random 20-char
+#                       password is generated per run and printed ONCE in the
+#                       step-2 log. Never hardcode passwords in this file.
+
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Tailscale hostname (empty = auto from run id)'
+        required: false
+        default: ''
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350  # just under GitHub's 360-min hard kill
+
+    steps:
+      - name: 1. Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+
+      - name: 2. Create RDP admin account
+        run: |
+          $pw = '${{ secrets.RDP_PASSWORD }}'
+          if (-not $pw) {
+            $chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'
+            $pw = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+            Write-Host '## Generated RDP password (shown once, copy it now):'
+            Write-Host "## $pw"
+          }
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+          New-LocalUser -Name 'RdpAdmin' -Password $sec -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Administrators' -Member 'RdpAdmin' -ErrorAction SilentlyContinue
+          Write-Host "::add-mask::$pw"
+
+      - name: 3. Install Tailscale (wait for binary)
+        run: |
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile 'C:\tailscale.msi'
+          Start-Process msiexec -ArgumentList '/i C:\tailscale.msi /quiet /norestart' -Wait
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+          for ($i = 0; $i -lt 24 -and -not (Test-Path $exe); $i++) { Start-Sleep -Seconds 5 }
+          if (-not (Test-Path $exe)) { Write-Error 'Tailscale MSI install failed'; exit 1 }
+          Write-Host 'Tailscale installed.'
+
+      - name: 4. Join Tailscale network
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+          $hn = '${{ inputs.hostname }}'
+          if (-not $hn) { $hn = "gh-rdp-${{ github.run_id }}" }
+          $hn = $hn.ToLower()
+          & $exe up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$hn"
+          Start-Sleep -Seconds 10
+          $ip = (& $exe ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { Write-Error 'tailscale up gave no IPv4 — check the auth key (must be reusable, not expired/revoked)'; exit 1 }
+          Write-Host '=============================================='
+          Write-Host " RDP READY  ->  $ip"
+          Write-Host ' user: RdpAdmin   password: see step 2 log'
+          Write-Host ' session max: ~5h40m (GitHub 6h job cap)'
+          Write-Host '=============================================='
+
+      - name: 5. Keep alive
+        run: |
+          # 340 x 60s = 5h40m; the job timeout (350m) ends it cleanly after
+          for ($i = 1; $i -le 340; $i++) {
+            Start-Sleep -Seconds 60
+            if ($i % 20 -eq 0) { Write-Host "[$i/340] alive" }
+          }
